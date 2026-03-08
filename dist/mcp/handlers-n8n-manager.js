@@ -212,7 +212,13 @@ const autofixWorkflowSchema = zod_1.z.object({
         'node-type-correction',
         'webhook-missing-path',
         'typeversion-upgrade',
-        'version-migration'
+        'version-migration',
+        'tool-variant-correction',
+        'connection-numeric-keys',
+        'connection-invalid-type',
+        'connection-id-to-name',
+        'connection-duplicate-removal',
+        'connection-input-index'
     ])).optional(),
     confidenceThreshold: zod_1.z.enum(['high', 'medium', 'low']).optional().default('medium'),
     maxFixes: zod_1.z.number().optional().default(50)

@@ -1,5 +1,6 @@
 import { NodeRepository } from '../database/node-repository';
 import { EnhancedConfigValidator } from './enhanced-config-validator';
+export declare const VALID_CONNECTION_TYPES: Set<string>;
 interface WorkflowNode {
     id: string;
     name: string;
@@ -84,7 +85,12 @@ export declare class WorkflowValidator {
     private validateErrorOutputConfiguration;
     private validateAIToolConnection;
     private validateAIToolSource;
+    private getNodeOutputTypes;
+    private validateNotAISubNode;
+    private getShortNodeType;
+    private getConditionalOutputInfo;
     private validateOutputIndexBounds;
+    private validateConditionalBranchUsage;
     private validateInputIndexBounds;
     private flagOrphanedNodes;
     private validateTriggerReachability;

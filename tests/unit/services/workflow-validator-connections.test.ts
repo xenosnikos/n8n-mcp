@@ -63,6 +63,20 @@ describe('WorkflowValidator - Connection Validation (#620)', () => {
         outputs: ['main', 'main'],
         properties: [],
       },
+      'nodes-base.filter': {
+        type: 'nodes-base.filter',
+        displayName: 'Filter',
+        package: 'n8n-nodes-base',
+        outputs: ['main', 'main'],
+        properties: [],
+      },
+      'nodes-base.switch': {
+        type: 'nodes-base.switch',
+        displayName: 'Switch',
+        package: 'n8n-nodes-base',
+        outputs: ['main', 'main', 'main', 'main'],
+        properties: [],
+      },
       'nodes-base.googleSheets': {
         type: 'nodes-base.googleSheets',
         displayName: 'Google Sheets',
@@ -713,6 +727,192 @@ describe('WorkflowValidator - Connection Validation (#620)', () => {
       const orphanWarning = result.warnings.find(w => w.nodeName === 'Orphan');
       expect(orphanWarning).toBeDefined();
       expect(orphanWarning!.message).toContain('not connected to any other nodes');
+    });
+  });
+
+  describe('Conditional branch fan-out detection (CONDITIONAL_BRANCH_FANOUT)', () => {
+    it('should warn when IF node has both branches in main[0]', async () => {
+      const workflow = {
+        nodes: [
+          { id: '1', name: 'Trigger', type: 'n8n-nodes-base.manualTrigger', position: [0, 0], parameters: {} },
+          { id: '2', name: 'Route', type: 'n8n-nodes-base.if', position: [200, 0], parameters: {} },
+          { id: '3', name: 'TrueTarget', type: 'n8n-nodes-base.set', position: [400, 0], parameters: {} },
+          { id: '4', name: 'FalseTarget', type: 'n8n-nodes-base.set', position: [400, 200], parameters: {} },
+        ],
+        connections: {
+          'Trigger': { main: [[{ node: 'Route', type: 'main', index: 0 }]] },
+          'Route': {
+            main: [[{ node: 'TrueTarget', type: 'main', index: 0 }, { node: 'FalseTarget', type: 'main', index: 0 }]]
+          }
+        }
+      };
+
+      const result = await validator.validateWorkflow(workflow as any);
+      const warning = result.warnings.find(w => w.code === 'CONDITIONAL_BRANCH_FANOUT');
+      expect(warning).toBeDefined();
+      expect(warning!.nodeName).toBe('Route');
+      expect(warning!.message).toContain('2 connections on the "true" branch');
+      expect(warning!.message).toContain('"false" branch has no effect');
+    });
+
+    it('should not warn when IF node has correct true/false split', async () => {
+      const workflow = {
+        nodes: [
+          { id: '1', name: 'Trigger', type: 'n8n-nodes-base.manualTrigger', position: [0, 0], parameters: {} },
+          { id: '2', name: 'Route', type: 'n8n-nodes-base.if', position: [200, 0], parameters: {} },
+          { id: '3', name: 'TrueTarget', type: 'n8n-nodes-base.set', position: [400, 0], parameters: {} },
+          { id: '4', name: 'FalseTarget', type: 'n8n-nodes-base.set', position: [400, 200], parameters: {} },
+        ],
+        connections: {
+          'Trigger': { main: [[{ node: 'Route', type: 'main', index: 0 }]] },
+          'Route': {
+            main: [
+              [{ node: 'TrueTarget', type: 'main', index: 0 }],
+              [{ node: 'FalseTarget', type: 'main', index: 0 }]
+            ]
+          }
+        }
+      };
+
+      const result = await validator.validateWorkflow(workflow as any);
+      const warning = result.warnings.find(w => w.code === 'CONDITIONAL_BRANCH_FANOUT');
+      expect(warning).toBeUndefined();
+    });
+
+    it('should not warn when IF has fan-out on main[0] AND connections on main[1]', async () => {
+      const workflow = {
+        nodes: [
+          { id: '1', name: 'Trigger', type: 'n8n-nodes-base.manualTrigger', position: [0, 0], parameters: {} },
+          { id: '2', name: 'Route', type: 'n8n-nodes-base.if', position: [200, 0], parameters: {} },
+          { id: '3', name: 'TrueA', type: 'n8n-nodes-base.set', position: [400, 0], parameters: {} },
+          { id: '4', name: 'TrueB', type: 'n8n-nodes-base.set', position: [400, 100], parameters: {} },
+          { id: '5', name: 'FalseTarget', type: 'n8n-nodes-base.set', position: [400, 200], parameters: {} },
+        ],
+        connections: {
+          'Trigger': { main: [[{ node: 'Route', type: 'main', index: 0 }]] },
+          'Route': {
+            main: [
+              [{ node: 'TrueA', type: 'main', index: 0 }, { node: 'TrueB', type: 'main', index: 0 }],
+              [{ node: 'FalseTarget', type: 'main', index: 0 }]
+            ]
+          }
+        }
+      };
+
+      const result = await validator.validateWorkflow(workflow as any);
+      const warning = result.warnings.find(w => w.code === 'CONDITIONAL_BRANCH_FANOUT');
+      expect(warning).toBeUndefined();
+    });
+
+    it('should warn when Switch node has all connections on main[0]', async () => {
+      const workflow = {
+        nodes: [
+          { id: '1', name: 'Trigger', type: 'n8n-nodes-base.manualTrigger', position: [0, 0], parameters: {} },
+          { id: '2', name: 'MySwitch', type: 'n8n-nodes-base.switch', position: [200, 0], parameters: { rules: { values: [{ value: 'a' }, { value: 'b' }] } } },
+          { id: '3', name: 'TargetA', type: 'n8n-nodes-base.set', position: [400, 0], parameters: {} },
+          { id: '4', name: 'TargetB', type: 'n8n-nodes-base.set', position: [400, 200], parameters: {} },
+          { id: '5', name: 'TargetC', type: 'n8n-nodes-base.set', position: [400, 400], parameters: {} },
+        ],
+        connections: {
+          'Trigger': { main: [[{ node: 'MySwitch', type: 'main', index: 0 }]] },
+          'MySwitch': {
+            main: [[{ node: 'TargetA', type: 'main', index: 0 }, { node: 'TargetB', type: 'main', index: 0 }, { node: 'TargetC', type: 'main', index: 0 }]]
+          }
+        }
+      };
+
+      const result = await validator.validateWorkflow(workflow as any);
+      const warning = result.warnings.find(w => w.code === 'CONDITIONAL_BRANCH_FANOUT');
+      expect(warning).toBeDefined();
+      expect(warning!.nodeName).toBe('MySwitch');
+      expect(warning!.message).toContain('3 connections on output 0');
+      expect(warning!.message).toContain('other switch branches have no effect');
+    });
+
+    it('should not warn when Switch node has no rules parameter (indeterminate outputs)', async () => {
+      const workflow = {
+        nodes: [
+          { id: '1', name: 'Trigger', type: 'n8n-nodes-base.manualTrigger', position: [0, 0], parameters: {} },
+          { id: '2', name: 'MySwitch', type: 'n8n-nodes-base.switch', position: [200, 0], parameters: {} },
+          { id: '3', name: 'TargetA', type: 'n8n-nodes-base.set', position: [400, 0], parameters: {} },
+          { id: '4', name: 'TargetB', type: 'n8n-nodes-base.set', position: [400, 200], parameters: {} },
+        ],
+        connections: {
+          'Trigger': { main: [[{ node: 'MySwitch', type: 'main', index: 0 }]] },
+          'MySwitch': {
+            main: [[{ node: 'TargetA', type: 'main', index: 0 }, { node: 'TargetB', type: 'main', index: 0 }]]
+          }
+        }
+      };
+
+      const result = await validator.validateWorkflow(workflow as any);
+      const warning = result.warnings.find(w => w.code === 'CONDITIONAL_BRANCH_FANOUT');
+      expect(warning).toBeUndefined();
+    });
+
+    it('should not warn when regular node has fan-out on main[0]', async () => {
+      const workflow = {
+        nodes: [
+          { id: '1', name: 'Trigger', type: 'n8n-nodes-base.manualTrigger', position: [0, 0], parameters: {} },
+          { id: '2', name: 'MySet', type: 'n8n-nodes-base.set', position: [200, 0], parameters: {} },
+          { id: '3', name: 'TargetA', type: 'n8n-nodes-base.set', position: [400, 0], parameters: {} },
+          { id: '4', name: 'TargetB', type: 'n8n-nodes-base.set', position: [400, 200], parameters: {} },
+        ],
+        connections: {
+          'Trigger': { main: [[{ node: 'MySet', type: 'main', index: 0 }]] },
+          'MySet': {
+            main: [[{ node: 'TargetA', type: 'main', index: 0 }, { node: 'TargetB', type: 'main', index: 0 }]]
+          }
+        }
+      };
+
+      const result = await validator.validateWorkflow(workflow as any);
+      const warning = result.warnings.find(w => w.code === 'CONDITIONAL_BRANCH_FANOUT');
+      expect(warning).toBeUndefined();
+    });
+
+    it('should not warn when IF has only 1 connection on main[0] with empty main[1]', async () => {
+      const workflow = {
+        nodes: [
+          { id: '1', name: 'Trigger', type: 'n8n-nodes-base.manualTrigger', position: [0, 0], parameters: {} },
+          { id: '2', name: 'Route', type: 'n8n-nodes-base.if', position: [200, 0], parameters: {} },
+          { id: '3', name: 'TrueOnly', type: 'n8n-nodes-base.set', position: [400, 0], parameters: {} },
+        ],
+        connections: {
+          'Trigger': { main: [[{ node: 'Route', type: 'main', index: 0 }]] },
+          'Route': {
+            main: [[{ node: 'TrueOnly', type: 'main', index: 0 }]]
+          }
+        }
+      };
+
+      const result = await validator.validateWorkflow(workflow as any);
+      const warning = result.warnings.find(w => w.code === 'CONDITIONAL_BRANCH_FANOUT');
+      expect(warning).toBeUndefined();
+    });
+
+    it('should warn for Filter node with both branches in main[0]', async () => {
+      const workflow = {
+        nodes: [
+          { id: '1', name: 'Trigger', type: 'n8n-nodes-base.manualTrigger', position: [0, 0], parameters: {} },
+          { id: '2', name: 'MyFilter', type: 'n8n-nodes-base.filter', position: [200, 0], parameters: {} },
+          { id: '3', name: 'Matched', type: 'n8n-nodes-base.set', position: [400, 0], parameters: {} },
+          { id: '4', name: 'Unmatched', type: 'n8n-nodes-base.set', position: [400, 200], parameters: {} },
+        ],
+        connections: {
+          'Trigger': { main: [[{ node: 'MyFilter', type: 'main', index: 0 }]] },
+          'MyFilter': {
+            main: [[{ node: 'Matched', type: 'main', index: 0 }, { node: 'Unmatched', type: 'main', index: 0 }]]
+          }
+        }
+      };
+
+      const result = await validator.validateWorkflow(workflow as any);
+      const warning = result.warnings.find(w => w.code === 'CONDITIONAL_BRANCH_FANOUT');
+      expect(warning).toBeDefined();
+      expect(warning!.nodeName).toBe('MyFilter');
+      expect(warning!.message).toContain('"matched" branch');
+      expect(warning!.message).toContain('"unmatched" branch has no effect');
     });
   });
 });

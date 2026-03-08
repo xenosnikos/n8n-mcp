@@ -22,7 +22,7 @@ const logger = new Logger({ prefix: '[WorkflowValidator]' });
  * All valid connection output keys in n8n workflows.
  * Any key not in this set is malformed and should be flagged.
  */
-const VALID_CONNECTION_TYPES = new Set<string>([
+export const VALID_CONNECTION_TYPES = new Set<string>([
   'main',
   'error',
   ...AI_CONNECTION_TYPES,
@@ -650,6 +650,11 @@ export class WorkflowValidator {
           this.validateAIToolSource(sourceNode, result);
         }
 
+        // Validate that AI sub-nodes are not connected via main
+        if (outputKey === 'main') {
+          this.validateNotAISubNode(sourceNode, result);
+        }
+
         this.validateConnectionOutputs(
           sourceName,
           outputConnections,
@@ -695,6 +700,7 @@ export class WorkflowValidator {
     if (outputType === 'main' && sourceNode) {
       this.validateErrorOutputConfiguration(sourceName, sourceNode, outputs, nodeMap, result);
       this.validateOutputIndexBounds(sourceNode, outputs, result);
+      this.validateConditionalBranchUsage(sourceNode, outputs, result);
     }
 
     outputs.forEach((outputConnections, outputIndex) => {
@@ -988,6 +994,85 @@ export class WorkflowValidator {
   }
 
   /**
+   * Get the static output types for a node from the database.
+   * Returns null if outputs contain expressions (dynamic) or node not found.
+   */
+  private getNodeOutputTypes(nodeType: string): string[] | null {
+    const normalizedType = NodeTypeNormalizer.normalizeToFullForm(nodeType);
+    const nodeInfo = this.nodeRepository.getNode(normalizedType);
+    if (!nodeInfo || !nodeInfo.outputs) return null;
+
+    const outputs = nodeInfo.outputs;
+    if (!Array.isArray(outputs)) return null;
+
+    // Skip if any output is an expression (dynamic — can't determine statically)
+    for (const output of outputs) {
+      if (typeof output === 'string' && output.startsWith('={{')) {
+        return null;
+      }
+    }
+
+    return outputs;
+  }
+
+  /**
+   * Validate that AI sub-nodes (nodes that only output AI connection types)
+   * are not connected via "main" connections.
+   */
+  private validateNotAISubNode(
+    sourceNode: WorkflowNode,
+    result: WorkflowValidationResult
+  ): void {
+    const outputTypes = this.getNodeOutputTypes(sourceNode.type);
+    if (!outputTypes) return; // Unknown or dynamic — skip
+
+    // Check if the node outputs ONLY AI types (no 'main')
+    const hasMainOutput = outputTypes.some(t => t === 'main');
+    if (hasMainOutput) return; // Node can legitimately output main
+
+    // All outputs are AI types — this node should not be connected via main
+    const aiTypes = outputTypes.filter(t => t !== 'main');
+    const expectedType = aiTypes[0] || 'ai_languageModel';
+
+    result.errors.push({
+      type: 'error',
+      nodeId: sourceNode.id,
+      nodeName: sourceNode.name,
+      message: `Node "${sourceNode.name}" (${sourceNode.type}) is an AI sub-node that outputs "${expectedType}" connections. ` +
+        `It cannot be used with "main" connections. Connect it to an AI Agent or Chain via "${expectedType}" instead.`,
+      code: 'AI_SUBNODE_MAIN_CONNECTION'
+    });
+  }
+
+  /**
+   * Derive the short node type name (e.g., "if", "switch", "set") from a workflow node.
+   */
+  private getShortNodeType(sourceNode: WorkflowNode): string {
+    const normalizedType = NodeTypeNormalizer.normalizeToFullForm(sourceNode.type);
+    return normalizedType.replace(/^(n8n-)?nodes-base\./, '');
+  }
+
+  /**
+   * Get the expected main output count for a conditional node (IF, Filter, Switch).
+   * Returns null for non-conditional nodes or when the count cannot be determined.
+   */
+  private getConditionalOutputInfo(sourceNode: WorkflowNode): { shortType: string; expectedOutputs: number } | null {
+    const shortType = this.getShortNodeType(sourceNode);
+
+    if (shortType === 'if' || shortType === 'filter') {
+      return { shortType, expectedOutputs: 2 };
+    }
+    if (shortType === 'switch') {
+      const rules = sourceNode.parameters?.rules?.values || sourceNode.parameters?.rules;
+      if (Array.isArray(rules)) {
+        return { shortType, expectedOutputs: rules.length + 1 }; // rules + fallback
+      }
+      return null; // Cannot determine dynamic output count
+    }
+    return null;
+  }
+
+  /**
    * Validate that output indices don't exceed what the node type supports.
    */
   private validateOutputIndexBounds(
@@ -1012,19 +1097,13 @@ export class WorkflowValidator {
 
     if (mainOutputCount === 0) return;
 
-    // Account for dynamic output counts based on node type and parameters
-    const shortType = normalizedType.replace(/^(n8n-)?nodes-base\./, '');
-    if (shortType === 'switch') {
-      // Switch node: output count depends on rules configuration
-      const rules = sourceNode.parameters?.rules?.values || sourceNode.parameters?.rules;
-      if (Array.isArray(rules)) {
-        mainOutputCount = rules.length + 1; // rules + fallback
-      } else {
-        return; // Cannot determine dynamic output count, skip bounds check
-      }
-    }
-    if (shortType === 'if' || shortType === 'filter') {
-      mainOutputCount = 2; // true/false
+    // Override with dynamic output counts for conditional nodes
+    const conditionalInfo = this.getConditionalOutputInfo(sourceNode);
+    if (conditionalInfo) {
+      mainOutputCount = conditionalInfo.expectedOutputs;
+    } else if (this.getShortNodeType(sourceNode) === 'switch') {
+      // Switch without determinable rules -- skip bounds check
+      return;
     }
 
     // Account for continueErrorOutput adding an extra output
@@ -1050,6 +1129,60 @@ export class WorkflowValidator {
         }
       }
     }
+  }
+
+  /**
+   * Detect when a conditional node (IF, Filter, Switch) has all connections
+   * crammed into main[0] with higher-index outputs empty. This usually means
+   * both branches execute together on one condition, while the other branches
+   * have no effect.
+   */
+  private validateConditionalBranchUsage(
+    sourceNode: WorkflowNode,
+    outputs: Array<Array<{ node: string; type: string; index: number }>>,
+    result: WorkflowValidationResult
+  ): void {
+    const conditionalInfo = this.getConditionalOutputInfo(sourceNode);
+    if (!conditionalInfo || conditionalInfo.expectedOutputs < 2) return;
+
+    const { shortType, expectedOutputs } = conditionalInfo;
+
+    // Check: main[0] has >= 2 connections AND all main[1+] are empty
+    const main0Count = outputs[0]?.length || 0;
+    if (main0Count < 2) return;
+
+    const hasHigherIndexConnections = outputs.slice(1).some(
+      conns => conns && conns.length > 0
+    );
+    if (hasHigherIndexConnections) return;
+
+    // Build a context-appropriate warning message
+    let message: string;
+    if (shortType === 'if' || shortType === 'filter') {
+      const isFilter = shortType === 'filter';
+      const displayName = isFilter ? 'Filter' : 'IF';
+      const trueLabel = isFilter ? 'matched' : 'true';
+      const falseLabel = isFilter ? 'unmatched' : 'false';
+      message = `${displayName} node "${sourceNode.name}" has ${main0Count} connections on the "${trueLabel}" branch (main[0]) ` +
+        `but no connections on the "${falseLabel}" branch (main[1]). ` +
+        `All ${main0Count} target nodes execute together on the "${trueLabel}" branch, ` +
+        `while the "${falseLabel}" branch has no effect. ` +
+        `Split connections: main[0] for ${trueLabel}, main[1] for ${falseLabel}.`;
+    } else {
+      message = `Switch node "${sourceNode.name}" has ${main0Count} connections on output 0 ` +
+        `but no connections on any other outputs (1-${expectedOutputs - 1}). ` +
+        `All ${main0Count} target nodes execute together on output 0, ` +
+        `while other switch branches have no effect. ` +
+        `Distribute connections across outputs to match switch rules.`;
+    }
+
+    result.warnings.push({
+      type: 'warning',
+      nodeId: sourceNode.id,
+      nodeName: sourceNode.name,
+      message,
+      code: 'CONDITIONAL_BRANCH_FANOUT'
+    });
   }
 
   /**

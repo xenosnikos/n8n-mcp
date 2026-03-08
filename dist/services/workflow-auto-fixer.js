@@ -3,9 +3,10 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.WorkflowAutoFixer = void 0;
+exports.WorkflowAutoFixer = exports.CONNECTION_FIX_TYPES = void 0;
 exports.isNodeFormatIssue = isNodeFormatIssue;
 const crypto_1 = __importDefault(require("crypto"));
+const workflow_validator_1 = require("./workflow-validator");
 const node_similarity_service_1 = require("./node-similarity-service");
 const logger_1 = require("../utils/logger");
 const node_version_service_1 = require("./node-version-service");
@@ -13,6 +14,13 @@ const breaking_change_detector_1 = require("./breaking-change-detector");
 const node_migration_service_1 = require("./node-migration-service");
 const post_update_validator_1 = require("./post-update-validator");
 const logger = new logger_1.Logger({ prefix: '[WorkflowAutoFixer]' });
+exports.CONNECTION_FIX_TYPES = [
+    'connection-numeric-keys',
+    'connection-invalid-type',
+    'connection-id-to-name',
+    'connection-duplicate-removal',
+    'connection-input-index'
+];
 function isNodeFormatIssue(issue) {
     return 'nodeName' in issue && 'nodeId' in issue &&
         typeof issue.nodeName === 'string' &&
@@ -72,6 +80,7 @@ class WorkflowAutoFixer {
         if (!fullConfig.fixTypes || fullConfig.fixTypes.includes('version-migration')) {
             await this.processVersionMigrationFixes(workflow, nodeMap, operations, fixes, postUpdateGuidance);
         }
+        this.processConnectionFixes(workflow, validationResult, fullConfig, operations, fixes);
         const filteredFixes = this.filterByConfidence(fixes, fullConfig.confidenceThreshold);
         const filteredOperations = this.filterOperationsByFixes(operations, filteredFixes, fixes);
         const limitedFixes = filteredFixes.slice(0, fullConfig.maxFixes);
@@ -393,9 +402,13 @@ class WorkflowAutoFixer {
     }
     filterOperationsByFixes(operations, filteredFixes, allFixes) {
         const fixedNodes = new Set(filteredFixes.map(f => f.node));
+        const hasConnectionFixes = filteredFixes.some(f => exports.CONNECTION_FIX_TYPES.includes(f.type));
         return operations.filter(op => {
             if (op.type === 'updateNode') {
                 return fixedNodes.has(op.nodeId || '');
+            }
+            if (op.type === 'replaceConnections') {
+                return hasConnectionFixes;
             }
             return true;
         });
@@ -411,7 +424,12 @@ class WorkflowAutoFixer {
                 'webhook-missing-path': 0,
                 'typeversion-upgrade': 0,
                 'version-migration': 0,
-                'tool-variant-correction': 0
+                'tool-variant-correction': 0,
+                'connection-numeric-keys': 0,
+                'connection-invalid-type': 0,
+                'connection-id-to-name': 0,
+                'connection-duplicate-removal': 0,
+                'connection-input-index': 0
             },
             byConfidence: {
                 'high': 0,
@@ -454,10 +472,298 @@ class WorkflowAutoFixer {
         if (stats.byType['tool-variant-correction'] > 0) {
             parts.push(`${stats.byType['tool-variant-correction']} tool variant ${stats.byType['tool-variant-correction'] === 1 ? 'correction' : 'corrections'}`);
         }
+        const connectionIssueCount = (stats.byType['connection-numeric-keys'] || 0) +
+            (stats.byType['connection-invalid-type'] || 0) +
+            (stats.byType['connection-id-to-name'] || 0) +
+            (stats.byType['connection-duplicate-removal'] || 0) +
+            (stats.byType['connection-input-index'] || 0);
+        if (connectionIssueCount > 0) {
+            parts.push(`${connectionIssueCount} connection ${connectionIssueCount === 1 ? 'issue' : 'issues'}`);
+        }
         if (parts.length === 0) {
             return `Fixed ${stats.total} ${stats.total === 1 ? 'issue' : 'issues'}`;
         }
         return `Fixed ${parts.join(', ')}`;
+    }
+    processConnectionFixes(workflow, validationResult, config, operations, fixes) {
+        if (!workflow.connections || Object.keys(workflow.connections).length === 0) {
+            return;
+        }
+        const idToNameMap = new Map();
+        const nameSet = new Set();
+        for (const node of workflow.nodes) {
+            idToNameMap.set(node.id, node.name);
+            nameSet.add(node.name);
+        }
+        const conn = JSON.parse(JSON.stringify(workflow.connections));
+        let anyFixed = false;
+        if (!config.fixTypes || config.fixTypes.includes('connection-numeric-keys')) {
+            const numericKeyResult = this.fixNumericKeys(conn);
+            if (numericKeyResult.length > 0) {
+                fixes.push(...numericKeyResult);
+                anyFixed = true;
+            }
+        }
+        if (!config.fixTypes || config.fixTypes.includes('connection-id-to-name')) {
+            const idToNameResult = this.fixIdToName(conn, idToNameMap, nameSet);
+            if (idToNameResult.length > 0) {
+                fixes.push(...idToNameResult);
+                anyFixed = true;
+            }
+        }
+        if (!config.fixTypes || config.fixTypes.includes('connection-invalid-type')) {
+            const invalidTypeResult = this.fixInvalidTypes(conn);
+            if (invalidTypeResult.length > 0) {
+                fixes.push(...invalidTypeResult);
+                anyFixed = true;
+            }
+        }
+        if (!config.fixTypes || config.fixTypes.includes('connection-input-index')) {
+            const inputIndexResult = this.fixInputIndices(conn, validationResult, workflow);
+            if (inputIndexResult.length > 0) {
+                fixes.push(...inputIndexResult);
+                anyFixed = true;
+            }
+        }
+        if (!config.fixTypes || config.fixTypes.includes('connection-duplicate-removal')) {
+            const dedupResult = this.fixDuplicateConnections(conn);
+            if (dedupResult.length > 0) {
+                fixes.push(...dedupResult);
+                anyFixed = true;
+            }
+        }
+        if (anyFixed) {
+            const op = {
+                type: 'replaceConnections',
+                connections: conn
+            };
+            operations.push(op);
+        }
+    }
+    fixNumericKeys(conn) {
+        const fixes = [];
+        const sourceNodes = Object.keys(conn);
+        for (const sourceName of sourceNodes) {
+            const nodeConn = conn[sourceName];
+            const numericKeys = Object.keys(nodeConn).filter(k => /^\d+$/.test(k));
+            if (numericKeys.length === 0)
+                continue;
+            if (!nodeConn['main']) {
+                nodeConn['main'] = [];
+            }
+            for (const numKey of numericKeys) {
+                const index = parseInt(numKey, 10);
+                const entries = nodeConn[numKey];
+                while (nodeConn['main'].length <= index) {
+                    nodeConn['main'].push([]);
+                }
+                const hadExisting = nodeConn['main'][index] && nodeConn['main'][index].length > 0;
+                if (Array.isArray(entries)) {
+                    for (const outputGroup of entries) {
+                        if (Array.isArray(outputGroup)) {
+                            nodeConn['main'][index] = [
+                                ...nodeConn['main'][index],
+                                ...outputGroup
+                            ];
+                        }
+                    }
+                }
+                if (hadExisting) {
+                    logger.warn(`Merged numeric key "${numKey}" into existing main[${index}] on node "${sourceName}" - dedup pass will clean exact duplicates`);
+                }
+                fixes.push({
+                    node: sourceName,
+                    field: `connections.${sourceName}.${numKey}`,
+                    type: 'connection-numeric-keys',
+                    before: numKey,
+                    after: `main[${index}]`,
+                    confidence: hadExisting ? 'medium' : 'high',
+                    description: hadExisting
+                        ? `Merged numeric connection key "${numKey}" into existing main[${index}] on node "${sourceName}"`
+                        : `Converted numeric connection key "${numKey}" to main[${index}] on node "${sourceName}"`
+                });
+                delete nodeConn[numKey];
+            }
+        }
+        return fixes;
+    }
+    fixIdToName(conn, idToNameMap, nameSet) {
+        const fixes = [];
+        const renames = [];
+        const sourceKeys = Object.keys(conn);
+        for (const sourceKey of sourceKeys) {
+            if (idToNameMap.has(sourceKey) && !nameSet.has(sourceKey)) {
+                renames.push({ oldKey: sourceKey, newKey: idToNameMap.get(sourceKey) });
+            }
+        }
+        const newKeyCount = new Map();
+        for (const r of renames) {
+            newKeyCount.set(r.newKey, (newKeyCount.get(r.newKey) || 0) + 1);
+        }
+        const safeRenames = renames.filter(r => {
+            if ((newKeyCount.get(r.newKey) || 0) > 1) {
+                logger.warn(`Skipping ambiguous ID-to-name rename: "${r.oldKey}" → "${r.newKey}" (multiple IDs map to same name)`);
+                return false;
+            }
+            return true;
+        });
+        for (const { oldKey, newKey } of safeRenames) {
+            conn[newKey] = conn[oldKey];
+            delete conn[oldKey];
+            fixes.push({
+                node: newKey,
+                field: `connections.sourceKey`,
+                type: 'connection-id-to-name',
+                before: oldKey,
+                after: newKey,
+                confidence: 'high',
+                description: `Replaced node ID "${oldKey}" with name "${newKey}" as connection source key`
+            });
+        }
+        for (const sourceName of Object.keys(conn)) {
+            const nodeConn = conn[sourceName];
+            for (const outputKey of Object.keys(nodeConn)) {
+                const outputs = nodeConn[outputKey];
+                if (!Array.isArray(outputs))
+                    continue;
+                for (const outputGroup of outputs) {
+                    if (!Array.isArray(outputGroup))
+                        continue;
+                    for (const entry of outputGroup) {
+                        if (entry && entry.node && idToNameMap.has(entry.node) && !nameSet.has(entry.node)) {
+                            const oldNode = entry.node;
+                            const newNode = idToNameMap.get(entry.node);
+                            entry.node = newNode;
+                            fixes.push({
+                                node: sourceName,
+                                field: `connections.${sourceName}.${outputKey}[].node`,
+                                type: 'connection-id-to-name',
+                                before: oldNode,
+                                after: newNode,
+                                confidence: 'high',
+                                description: `Replaced target node ID "${oldNode}" with name "${newNode}" in connection from "${sourceName}"`
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        return fixes;
+    }
+    fixInvalidTypes(conn) {
+        const fixes = [];
+        for (const sourceName of Object.keys(conn)) {
+            const nodeConn = conn[sourceName];
+            for (const outputKey of Object.keys(nodeConn)) {
+                const outputs = nodeConn[outputKey];
+                if (!Array.isArray(outputs))
+                    continue;
+                for (const outputGroup of outputs) {
+                    if (!Array.isArray(outputGroup))
+                        continue;
+                    for (const entry of outputGroup) {
+                        if (entry && entry.type && !workflow_validator_1.VALID_CONNECTION_TYPES.has(entry.type)) {
+                            const oldType = entry.type;
+                            const newType = workflow_validator_1.VALID_CONNECTION_TYPES.has(outputKey) ? outputKey : 'main';
+                            entry.type = newType;
+                            fixes.push({
+                                node: sourceName,
+                                field: `connections.${sourceName}.${outputKey}[].type`,
+                                type: 'connection-invalid-type',
+                                before: oldType,
+                                after: newType,
+                                confidence: 'high',
+                                description: `Fixed invalid connection type "${oldType}" → "${newType}" in connection from "${sourceName}" to "${entry.node}"`
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        return fixes;
+    }
+    fixInputIndices(conn, validationResult, workflow) {
+        const fixes = [];
+        for (const error of validationResult.errors) {
+            if (error.code !== 'INPUT_INDEX_OUT_OF_BOUNDS')
+                continue;
+            const targetNodeName = error.nodeName;
+            if (!targetNodeName)
+                continue;
+            const match = error.message.match(/Input index (\d+).*?has (\d+) main input/);
+            if (!match) {
+                logger.warn(`Could not parse INPUT_INDEX_OUT_OF_BOUNDS error for node "${targetNodeName}": ${error.message}`);
+                continue;
+            }
+            const badIndex = parseInt(match[1], 10);
+            const inputCount = parseInt(match[2], 10);
+            const clampedIndex = inputCount > 1 ? Math.min(badIndex, inputCount - 1) : 0;
+            for (const sourceName of Object.keys(conn)) {
+                const nodeConn = conn[sourceName];
+                for (const outputKey of Object.keys(nodeConn)) {
+                    const outputs = nodeConn[outputKey];
+                    if (!Array.isArray(outputs))
+                        continue;
+                    for (const outputGroup of outputs) {
+                        if (!Array.isArray(outputGroup))
+                            continue;
+                        for (const entry of outputGroup) {
+                            if (entry && entry.node === targetNodeName && entry.index === badIndex) {
+                                entry.index = clampedIndex;
+                                fixes.push({
+                                    node: sourceName,
+                                    field: `connections.${sourceName}.${outputKey}[].index`,
+                                    type: 'connection-input-index',
+                                    before: badIndex,
+                                    after: clampedIndex,
+                                    confidence: 'medium',
+                                    description: `Clamped input index ${badIndex} → ${clampedIndex} for target node "${targetNodeName}" (has ${inputCount} input${inputCount === 1 ? '' : 's'})`
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return fixes;
+    }
+    fixDuplicateConnections(conn) {
+        const fixes = [];
+        for (const sourceName of Object.keys(conn)) {
+            const nodeConn = conn[sourceName];
+            for (const outputKey of Object.keys(nodeConn)) {
+                const outputs = nodeConn[outputKey];
+                if (!Array.isArray(outputs))
+                    continue;
+                for (let i = 0; i < outputs.length; i++) {
+                    const outputGroup = outputs[i];
+                    if (!Array.isArray(outputGroup))
+                        continue;
+                    const seen = new Set();
+                    const deduped = [];
+                    for (const entry of outputGroup) {
+                        const key = JSON.stringify({ node: entry.node, type: entry.type, index: entry.index });
+                        if (seen.has(key)) {
+                            fixes.push({
+                                node: sourceName,
+                                field: `connections.${sourceName}.${outputKey}[${i}]`,
+                                type: 'connection-duplicate-removal',
+                                before: entry,
+                                after: null,
+                                confidence: 'high',
+                                description: `Removed duplicate connection from "${sourceName}" to "${entry.node}" (type: ${entry.type}, index: ${entry.index})`
+                            });
+                        }
+                        else {
+                            seen.add(key);
+                            deduped.push(entry);
+                        }
+                    }
+                    outputs[i] = deduped;
+                }
+            }
+        }
+        return fixes;
     }
     async processVersionUpgradeFixes(workflow, nodeMap, operations, fixes, postUpdateGuidance) {
         if (!this.versionService || !this.migrationService || !this.postUpdateValidator) {

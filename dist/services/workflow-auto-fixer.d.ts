@@ -5,7 +5,8 @@ import { WorkflowDiffOperation } from '../types/workflow-diff';
 import { Workflow } from '../types/n8n-api';
 import { PostUpdateGuidance } from './post-update-validator';
 export type FixConfidenceLevel = 'high' | 'medium' | 'low';
-export type FixType = 'expression-format' | 'typeversion-correction' | 'error-output-config' | 'node-type-correction' | 'webhook-missing-path' | 'typeversion-upgrade' | 'version-migration' | 'tool-variant-correction';
+export type FixType = 'expression-format' | 'typeversion-correction' | 'error-output-config' | 'node-type-correction' | 'webhook-missing-path' | 'typeversion-upgrade' | 'version-migration' | 'tool-variant-correction' | 'connection-numeric-keys' | 'connection-invalid-type' | 'connection-id-to-name' | 'connection-duplicate-removal' | 'connection-input-index';
+export declare const CONNECTION_FIX_TYPES: FixType[];
 export interface AutoFixConfig {
     applyFixes: boolean;
     fixTypes?: FixType[];
@@ -68,6 +69,12 @@ export declare class WorkflowAutoFixer {
     private filterOperationsByFixes;
     private calculateStats;
     private generateSummary;
+    private processConnectionFixes;
+    private fixNumericKeys;
+    private fixIdToName;
+    private fixInvalidTypes;
+    private fixInputIndices;
+    private fixDuplicateConnections;
     private processVersionUpgradeFixes;
     private processVersionMigrationFixes;
 }

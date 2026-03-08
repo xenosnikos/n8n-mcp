@@ -278,7 +278,7 @@ exports.n8nManagementTools = [
     },
     {
         name: 'n8n_autofix_workflow',
-        description: `Automatically fix common workflow validation errors. Preview fixes or apply them. Fixes expression format, typeVersion, error output config, webhook paths.`,
+        description: `Automatically fix common workflow validation errors. Preview fixes or apply them. Fixes expression format, typeVersion, error output config, webhook paths, connection structure issues (numeric keys, invalid types, ID-to-name, duplicates, out-of-bounds indices).`,
         inputSchema: {
             type: 'object',
             properties: {
@@ -295,7 +295,7 @@ exports.n8nManagementTools = [
                     description: 'Types of fixes to apply (default: all)',
                     items: {
                         type: 'string',
-                        enum: ['expression-format', 'typeversion-correction', 'error-output-config', 'node-type-correction', 'webhook-missing-path', 'typeversion-upgrade', 'version-migration']
+                        enum: ['expression-format', 'typeversion-correction', 'error-output-config', 'node-type-correction', 'webhook-missing-path', 'typeversion-upgrade', 'version-migration', 'tool-variant-correction', 'connection-numeric-keys', 'connection-invalid-type', 'connection-id-to-name', 'connection-duplicate-removal', 'connection-input-index']
                     }
                 },
                 confidenceThreshold: {

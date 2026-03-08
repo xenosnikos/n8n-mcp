@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.36.1] - 2026-03-08
+
+### Added
+
+- **Conditional branch fan-out detection** (`CONDITIONAL_BRANCH_FANOUT`): Warns when IF, Filter, or Switch nodes have all connections crammed into `main[0]` with higher-index outputs empty, which usually means all target nodes execute together on one branch while other branches have no effect
+  - Detects IF nodes with both true/false targets on `main[0]`
+  - Detects Filter nodes with both matched/unmatched targets on `main[0]`
+  - Detects Switch nodes with all targets on output 0 and other outputs unused
+  - Skips warning when fan-out is legitimate (higher outputs also have connections)
+  - Skips warning for single connections (intentional true-only/matched-only usage)
+
+### Changed
+
+- **Refactored output index validation**: Extracted `getShortNodeType()` and `getConditionalOutputInfo()` helpers to eliminate duplicated conditional node detection logic between `validateOutputIndexBounds` and the new `validateConditionalBranchUsage`
+
+Conceived by Romuald Czlonkowski - https://www.aiadvisors.pl/en
+
 ## [2.36.0] - 2026-03-07
 
 ### Added
